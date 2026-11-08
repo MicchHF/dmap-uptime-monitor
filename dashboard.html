@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f7f7">
+  <title>Статус D-Map</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font: 16px/1.5 system-ui, sans-serif;
+      color: #14282b;
+      background: #f4f7f7;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { width: min(100% - 2rem, 40rem); margin: 3rem auto; }
+    header { margin-bottom: 1.25rem; }
+    h1, h2, p { margin: 0; }
+    h1 { font-size: clamp(1.85rem, 6vw, 2.65rem); letter-spacing: -.045em; }
+    .muted { color: #4b6266; }
+    .panel {
+      background: #fff;
+      border: 1px solid #dce6e6;
+      border-radius: 1rem;
+    }
+    .summary {
+      padding: 1.25rem 1.5rem;
+      border-left: .3rem solid var(--tone);
+    }
+    [data-state="healthy"] { --tone: #08694c; --tint: #e7f5ee; }
+    [data-state="degraded"] { --tone: #a33a18; --tint: #fff0e6; }
+    [data-state="unknown"] { --tone: #4d6167; --tint: #edf2f3; }
+    .summary h2 { font-size: 1.25rem; color: var(--tone); }
+    .summary p { margin-top: .25rem; }
+    ul { list-style: none; padding: 0; margin: 1rem 0; }
+    li {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: .5rem;
+      padding: .85rem 1.5rem;
+    }
+    li + li { border-top: 1px solid #e6eeee; }
+    .badge {
+      padding: .2rem .65rem;
+      border-radius: 1rem;
+      color: var(--tone);
+      background: var(--tint);
+      font-size: .875rem;
+      font-weight: 600;
+    }
+    footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: .75rem;
+      font-size: .9rem;
+    }
+    a {
+      display: inline-block;
+      padding: .4rem .8rem;
+      color: #18545a;
+      background: #fff;
+      border: 1px solid #cfdddd;
+      border-radius: .5rem;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    a:hover { background: #e8f3f2; }
+    a:focus-visible { outline: 2px solid #18545a; outline-offset: 3px; }
+    @media (max-width: 30rem) {
+      main { margin: 1.5rem auto; }
+      .summary, li { padding-left: 1rem; padding-right: 1rem; }
+    }
+  </style>
+  <script defer src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => window.Telegram?.WebApp?.ready());
+  </script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Статус D-Map</h1>
+      <p class="muted">Проверка доступности из Render</p>
+    </header>
+    <section class="panel summary" data-state="$state" aria-labelledby="summary">
+      <h2 id="summary">$summary</h2>
+      <p class="muted">Последняя проверка · $checked_at</p>
+    </section>
+    <ul class="panel" aria-label="Сервисы D-Map">
+      $targets
+    </ul>
+    <footer>
+      <span class="muted">Проверки каждые 2 минуты</span>
+      <a href="/">Обновить</a>
+    </footer>
+  </main>
+</body>
+</html>

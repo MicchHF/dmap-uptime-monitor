@@ -8,8 +8,11 @@ import socket
 import ssl
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPException
+from pathlib import Path
 from secrets import compare_digest
+from string import Template
 from threading import Thread
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -20,14 +23,17 @@ from redis.exceptions import LockError, LockNotOwnedError, RedisError
 from redis.retry import Retry
 
 ORIGIN = "https://map.dalazareva.ru"
-CHECK_PATHS = ("/map/health", "/map/", "/map/cabinet/")
+CHECK_TARGETS = {"/map/": "Карта", "/map/cabinet/": "Кабинет", "/map/health": "API"}
 STATE_KEY = "dmap:uptime:v1:state"
 LOCK_KEY = "dmap:uptime:v1:lock"
 FAILURES_BEFORE_ALERT = 2
 MIN_CHECK_INTERVAL = 60
 SCHEDULE_INTERVAL = 120
+STALE_AFTER = 2 * SCHEDULE_INTERVAL + MIN_CHECK_INTERVAL
 HTTP_TIMEOUT = 5
 LOG = logging.getLogger("gunicorn.error")
+MOSCOW = timezone(timedelta(hours=3))
+DASHBOARD = Template(Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8"))
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -74,9 +80,9 @@ def probe(path):
 
 
 def check_targets():
-    with ThreadPoolExecutor(max_workers=len(CHECK_PATHS)) as executor:
-        results = executor.map(probe, CHECK_PATHS)
-        return {path: error for path, error in zip(CHECK_PATHS, results) if error}
+    with ThreadPoolExecutor(max_workers=len(CHECK_TARGETS)) as executor:
+        results = executor.map(probe, CHECK_TARGETS)
+        return {path: error for path, error in zip(CHECK_TARGETS, results) if error}
 
 
 class TelegramError(RuntimeError):
@@ -131,6 +137,7 @@ def run_check(redis, notify, chat_ids, get_errors=check_targets):
         def save_state():
             redis.set(STATE_KEY, json.dumps({
                 "checked_at": now, "failures": failures, "alerted_chats": sorted(alerted),
+                "errors": errors,
             }))
 
         def mark_alerted(chat_id):
@@ -157,6 +164,38 @@ def run_check(redis, notify, chat_ids, get_errors=check_targets):
             )
 
         return {"status": "degraded" if errors else "healthy", "errors": errors}
+
+
+def render_dashboard(state):
+    errors = state.get("errors")
+    checked_at = state.get("checked_at", 0)
+    checked_at_text = "ещё не было"
+    if checked_at:
+        checked_at_text = datetime.fromtimestamp(checked_at, MOSCOW).strftime("%d.%m.%Y, %H:%M МСК")
+
+    has_result = isinstance(errors, dict) and checked_at > 0
+    if not has_result:
+        status, summary = "unknown", "Ожидаем результат проверки"
+    elif time.time() - checked_at > STALE_AFTER:
+        status, summary = "unknown", "Результат проверки устарел"
+    elif errors:
+        status, summary = "degraded", "Обнаружены проблемы"
+    else:
+        status, summary = "healthy", "Все сервисы доступны"
+
+    targets = []
+    for path, name in CHECK_TARGETS.items():
+        if status == "unknown":
+            target_status, label = "unknown", "Нет данных"
+        elif path in errors:
+            target_status, label = "degraded", "Сбой"
+        else:
+            target_status, label = "healthy", "В норме"
+        targets.append(f'<li><span>{name}</span><span class="badge" data-state="{target_status}">{label}</span></li>')
+
+    return DASHBOARD.substitute(
+        state=status, summary=summary, checked_at=checked_at_text, targets="\n      ".join(targets),
+    )
 
 
 def run_schedule(check):
@@ -199,10 +238,12 @@ def create_app(*, schedule=False):
         return run_check(redis, notify, chat_ids)
 
     def app(environ, start_response):
-        def respond(status, payload):
-            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        def respond(status, payload, content_type="application/json"):
+            if content_type == "application/json":
+                payload = json.dumps(payload, ensure_ascii=False)
+            body = payload.encode("utf-8")
             start_response(status, [
-                ("Content-Type", "application/json; charset=utf-8"),
+                ("Content-Type", f"{content_type}; charset=utf-8"),
                 ("Cache-Control", "no-store"),
                 ("Content-Length", str(len(body))),
             ])
@@ -210,6 +251,12 @@ def create_app(*, schedule=False):
 
         path = environ["PATH_INFO"]
         method = environ["REQUEST_METHOD"]
+        if path == "/" and method == "GET":
+            try:
+                state = json.loads(redis.get(STATE_KEY) or "{}")
+            except (RedisError, ValueError):
+                return respond("503 Service Unavailable", render_dashboard({}), "text/html")
+            return respond("200 OK", render_dashboard(state if isinstance(state, dict) else {}), "text/html")
         if path == "/healthz" and method == "GET":
             return respond("200 OK", {"ok": True})
         if path not in ("/check", "/test-alert") or method != "POST":
