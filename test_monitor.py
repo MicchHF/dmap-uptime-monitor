@@ -69,6 +69,46 @@ class MonitorTests(unittest.TestCase):
         self.notify.assert_called_once()
         self.assertEqual(json.loads(self.data[monitor.STATE_KEY])["alerted_chats"], [])
 
+    def test_report_records_short_and_continuing_incidents(self):
+        self.check_at(120)
+        self.assertEqual(self.check_at(125)["status"], "recently_checked")
+        self.errors.return_value = {}
+        self.check_at(240)
+        self.notify.assert_not_called()
+        self.errors.return_value = {"/map/": "тайм-аут"}
+        self.check_at(360)
+        self.errors.return_value = {"/map/cabinet/": "HTTP 503"}
+        self.check_at(480)
+
+        state = json.loads(self.data[monitor.STATE_KEY])
+        self.assertEqual(state["report_days"]["1970-01-01"], {"total": 4, "failed": 3})
+        self.assertEqual(state["incidents"], [
+            {"started_at": 120, "recovered_at": 240, "targets": ["/map/"]},
+            {"started_at": 360, "recovered_at": None, "targets": ["/map/", "/map/cabinet/"]},
+        ])
+        with patch.object(monitor.time, "time", return_value=480):
+            page = monitor.render_report(state)
+        self.assertIn('href="/report" aria-current="page"', page)
+        self.assertIn("25,0%", page)
+        self.assertIn("Восстановлено", page)
+        self.assertIn("Продолжается", page)
+
+    def test_report_expires_completed_incidents_but_keeps_an_ongoing_one(self):
+        self.check_at(120)
+        self.errors.return_value = {}
+        self.check_at(240)
+        self.errors.return_value = {"/map/": "тайм-аут"}
+        self.check_at(360)
+
+        now = 31 * 24 * 60 * 60
+        self.check_at(now)
+        state = json.loads(self.data[monitor.STATE_KEY])
+        self.assertEqual(len(state["report_days"]), 1)
+        self.assertEqual(state["incidents"], [
+            {"started_at": 360, "recovered_at": None, "targets": ["/map/"]},
+        ])
+
+
     def test_endpoints_require_auth_and_overlapping_check_is_skipped(self):
         config = {
             "CHECK_TOKEN": "x" * 32,

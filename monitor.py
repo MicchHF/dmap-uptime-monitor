@@ -8,7 +8,7 @@ import socket
 import ssl
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.client import HTTPException
 from pathlib import Path
 from secrets import compare_digest
@@ -29,6 +29,8 @@ LOCK_KEY = "dmap:uptime:v1:lock"
 FAILURES_BEFORE_ALERT = 2
 MIN_CHECK_INTERVAL = 60
 SCHEDULE_INTERVAL = 120
+REPORT_DAYS = 30
+MAX_INCIDENTS = 100
 STALE_AFTER = 2 * SCHEDULE_INTERVAL + MIN_CHECK_INTERVAL
 HTTP_TIMEOUT = 5
 LOG = logging.getLogger("gunicorn.error")
@@ -122,6 +124,38 @@ def send_alert(chat_ids, notify, message, on_delivery=None):
         raise error
 
 
+def report_data(state, now):
+    today = datetime.fromtimestamp(now, MOSCOW).date()
+    first_day = today - timedelta(days=REPORT_DAYS - 1)
+    first_timestamp = datetime.combine(first_day, datetime.min.time(), MOSCOW).timestamp()
+    days = {day: counts for day, counts in state.get("report_days", {}).items() if day >= first_day.isoformat()}
+    incidents = [
+        incident for incident in state.get("incidents", [])
+        if incident["recovered_at"] is None or incident["recovered_at"] >= first_timestamp
+    ]
+    return days, incidents[-MAX_INCIDENTS:]
+
+
+def record_check(state, now, errors):
+    days, incidents = report_data(state, now)
+    day = datetime.fromtimestamp(now, MOSCOW).date().isoformat()
+    counts = days.setdefault(day, {"total": 0, "failed": 0})
+    counts["total"] += 1
+    counts["failed"] += bool(errors)
+
+    active = incidents[-1] if incidents and incidents[-1]["recovered_at"] is None else None
+    if errors:
+        if active is None:
+            active = {"started_at": now, "recovered_at": None, "targets": []}
+            incidents.append(active)
+        affected = set(active["targets"]) | errors.keys()
+        active["targets"] = [path for path in CHECK_TARGETS if path in affected]
+    elif active is not None:
+        active["recovered_at"] = now
+
+    state.update(report_days=days, incidents=incidents[-MAX_INCIDENTS:])
+
+
 def run_check(redis, notify, chat_ids, get_errors=check_targets):
     with redis.lock(LOCK_KEY, timeout=90, blocking=False):
         state = json.loads(redis.get(STATE_KEY) or "{}")
@@ -134,11 +168,12 @@ def run_check(redis, notify, chat_ids, get_errors=check_targets):
         previously_alerted = state.get("alerted_chats", chat_ids[:1] if state.get("alerted") else ())
         alerted = set(previously_alerted).intersection(chat_ids)
 
+        record_check(state, now, errors)
+        state.update(checked_at=now, failures=failures, errors=errors)
+
         def save_state():
-            redis.set(STATE_KEY, json.dumps({
-                "checked_at": now, "failures": failures, "alerted_chats": sorted(alerted),
-                "errors": errors,
-            }))
+            state["alerted_chats"] = sorted(alerted)
+            redis.set(STATE_KEY, json.dumps(state))
 
         def mark_alerted(chat_id):
             alerted.add(chat_id)
@@ -166,12 +201,24 @@ def run_check(redis, notify, chat_ids, get_errors=check_targets):
         return {"status": "degraded" if errors else "healthy", "errors": errors}
 
 
+def render_page(path, content):
+    links = []
+    for url, label in (("/", "Статус"), ("/report", "Отчёт")):
+        current = ' aria-current="page"' if url == path else ""
+        links.append(f'<a href="{url}"{current}>{label}</a>')
+    return DASHBOARD.substitute(navigation=" ".join(links), content=content, refresh_url=path)
+
+
+def format_timestamp(timestamp):
+    return datetime.fromtimestamp(timestamp, MOSCOW).strftime("%d.%m.%Y, %H:%M МСК")
+
+
 def render_dashboard(state):
     errors = state.get("errors")
     checked_at = state.get("checked_at", 0)
     checked_at_text = "ещё не было"
     if checked_at:
-        checked_at_text = datetime.fromtimestamp(checked_at, MOSCOW).strftime("%d.%m.%Y, %H:%M МСК")
+        checked_at_text = format_timestamp(checked_at)
 
     has_result = isinstance(errors, dict) and checked_at > 0
     if not has_result:
@@ -193,9 +240,71 @@ def render_dashboard(state):
             target_status, label = "healthy", "В норме"
         targets.append(f'<li><span>{name}</span><span class="badge" data-state="{target_status}">{label}</span></li>')
 
-    return DASHBOARD.substitute(
-        state=status, summary=summary, checked_at=checked_at_text, targets="\n      ".join(targets),
+    return render_page("/", f"""
+    <section class="panel summary" data-state="{status}" aria-labelledby="summary">
+      <h2 id="summary">{summary}</h2>
+      <p class="muted">Последняя проверка · {checked_at_text}</p>
+    </section>
+    <ul class="panel" aria-label="Сервисы D-Map">{''.join(targets)}</ul>
+    """)
+
+
+def render_report(state):
+    days, incidents = report_data(state, time.time())
+    total = sum(counts["total"] for counts in days.values())
+    failed = sum(counts["failed"] for counts in days.values())
+    success_rate = f"{100 * (total - failed) / total:.1f}%".replace(".", ",") if total else "—"
+    daily_rows = []
+    for day, counts in sorted(days.items(), reverse=True):
+        label = date.fromisoformat(day).strftime("%d.%m")
+        daily_rows.append(f'<tr><th scope="row">{label}</th><td>{counts["total"]}</td><td>{counts["failed"]}</td></tr>')
+    daily_table = (
+        '<table><thead><tr><th scope="col">Дата</th><th scope="col">Проверок</th><th scope="col">Со сбоями</th>'
+        '</tr></thead><tbody>' + "".join(daily_rows) + "</tbody></table>"
+        if daily_rows else '<p class="muted report-empty">История пока пуста.</p>'
     )
+
+    incident_rows = []
+    for incident in reversed(incidents):
+        started = format_timestamp(incident["started_at"])
+        recovered_at = incident["recovered_at"]
+        targets = ", ".join(CHECK_TARGETS[path] for path in incident["targets"])
+        status, label = ("healthy", "Восстановлено") if recovered_at is not None else ("degraded", "Продолжается")
+        end = f'<p class="muted">Восстановлено · {format_timestamp(recovered_at)}</p>' if recovered_at is not None else ""
+        incident_rows.append(f"""
+        <li>
+          <div>
+            <p><strong>{targets}</strong></p>
+            <p class="muted">Обнаружено · {started}</p>
+            {end}
+          </div>
+          <span class="badge" data-state="{status}">{label}</span>
+        </li>
+        """)
+    incident_list = (
+        '<ul aria-label="История сбоев">' + "".join(incident_rows) + "</ul>"
+        if incident_rows else '<p class="muted report-empty">За период сбои не зафиксированы.</p>'
+    )
+
+    return render_page("/report", f"""
+    <section class="panel report-summary" aria-labelledby="report-summary">
+      <h2 id="report-summary">Сводка за {REPORT_DAYS} дней</h2>
+      <dl class="metrics">
+        <div><dt>Проверок</dt><dd>{total}</dd></div>
+        <div><dt>Со сбоями</dt><dd>{failed}</dd></div>
+        <div><dt>Успешных</dt><dd>{success_rate}</dd></div>
+      </dl>
+    </section>
+    <section class="panel report-section" aria-labelledby="incidents">
+      <h2 id="incidents">Сбои</h2>
+      <p class="muted section-note">Время по результатам проверок. До {MAX_INCIDENTS} последних сбоев.</p>
+      {incident_list}
+    </section>
+    <section class="panel report-section" aria-labelledby="daily">
+      <h2 id="daily">По дням</h2>
+      {daily_table}
+    </section>
+    """)
 
 
 def run_schedule(check):
@@ -251,12 +360,13 @@ def create_app(*, schedule=False):
 
         path = environ["PATH_INFO"]
         method = environ["REQUEST_METHOD"]
-        if path == "/" and method == "GET":
+        if path in ("/", "/report") and method == "GET":
+            render = render_report if path == "/report" else render_dashboard
             try:
                 state = json.loads(redis.get(STATE_KEY) or "{}")
             except (RedisError, ValueError):
-                return respond("503 Service Unavailable", render_dashboard({}), "text/html")
-            return respond("200 OK", render_dashboard(state if isinstance(state, dict) else {}), "text/html")
+                return respond("503 Service Unavailable", render({}), "text/html")
+            return respond("200 OK", render(state if isinstance(state, dict) else {}), "text/html")
         if path == "/healthz" and method == "GET":
             return respond("200 OK", {"ok": True})
         if path not in ("/check", "/test-alert") or method != "POST":

@@ -71,9 +71,32 @@
     }
     a:hover { background: #e8f3f2; }
     a:focus-visible { outline: 2px solid #18545a; outline-offset: 3px; }
+    nav { display: flex; gap: .5rem; margin-bottom: 1rem; }
+    nav a[aria-current="page"] { background: #18545a; border-color: #18545a; color: #fff; }
+    .report-summary { padding: 1rem 1.25rem; }
+    .report-summary h2, .report-section h2 { font-size: 1.125rem; }
+    .report-section { margin: 1rem 0; }
+    .report-section h2 { padding: 1rem 1.25rem .25rem; }
+    .section-note, .report-empty { padding: 0 1.25rem .85rem; font-size: .875rem; }
+    .report-section ul { margin: 0; }
+    .report-section li { padding: .75rem 1.25rem; font-size: .875rem; }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .5rem;
+      margin: .65rem 0 0;
+    }
+    .metrics dt { color: #4b6266; font-size: .8125rem; }
+    .metrics dd { margin: .15rem 0 0; font-size: 1.25rem; font-weight: 700; }
+    table { width: 100%; border-collapse: collapse; font-size: .875rem; }
+    th, td { padding: .55rem 1.25rem; text-align: right; }
+    th:first-child { text-align: left; }
+    thead { color: #4b6266; }
+    tbody tr { border-top: 1px solid #e6eeee; }
+
     @media (max-width: 30rem) {
       main { margin: 1.5rem auto; }
-      .summary, li { padding-left: 1rem; padding-right: 1rem; }
+      .summary, li, th, td { padding-left: 1rem; padding-right: 1rem; }
     }
   </style>
   <script defer src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -87,16 +110,11 @@
       <h1>Статус D-Map</h1>
       <p class="muted">Проверка доступности из Render</p>
     </header>
-    <section class="panel summary" data-state="$state" aria-labelledby="summary">
-      <h2 id="summary">$summary</h2>
-      <p class="muted">Последняя проверка · $checked_at</p>
-    </section>
-    <ul class="panel" aria-label="Сервисы D-Map">
-      $targets
-    </ul>
+    <nav aria-label="Разделы приложения">$navigation</nav>
+    $content
     <footer>
       <span class="muted">Проверки каждые 2 минуты</span>
-      <a href="/">Обновить</a>
+      <a href="$refresh_url">Обновить</a>
     </footer>
   </main>
 </body>
