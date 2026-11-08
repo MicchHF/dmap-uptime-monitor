@@ -10,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http.client import HTTPException
 from secrets import compare_digest
+from threading import Thread
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -24,6 +25,7 @@ STATE_KEY = "dmap:uptime:v1:state"
 LOCK_KEY = "dmap:uptime:v1:lock"
 FAILURES_BEFORE_ALERT = 2
 MIN_CHECK_INTERVAL = 60
+SCHEDULE_INTERVAL = 120
 HTTP_TIMEOUT = 5
 LOG = logging.getLogger("gunicorn.error")
 
@@ -157,7 +159,23 @@ def run_check(redis, notify, chat_ids, get_errors=check_targets):
         return {"status": "degraded" if errors else "healthy", "errors": errors}
 
 
-def create_app():
+def run_schedule(check):
+    while True:
+        started_at = time.monotonic()
+        try:
+            result = check()
+            LOG.info("Scheduled D-Map check: %s", result["status"])
+        except TelegramError as error:
+            LOG.warning("Scheduled D-Map check could not deliver a Telegram alert: %s", error)
+        except Exception as error:
+            if isinstance(error, LockError) and not isinstance(error, LockNotOwnedError):
+                LOG.info("Scheduled D-Map check skipped because a check is already running")
+            else:
+                LOG.error("Scheduled D-Map check failed (%s)", type(error).__name__)
+        time.sleep(max(0, SCHEDULE_INTERVAL - (time.monotonic() - started_at)))
+
+
+def create_app(*, schedule=False):
     check_token = os.environ["CHECK_TOKEN"]
     bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
     recipients = os.environ.get("TELEGRAM_CHAT_IDS", os.environ.get("TELEGRAM_CHAT_ID", ""))
@@ -176,6 +194,9 @@ def create_app():
 
     def notify(chat_id, message):
         telegram(bot_token, "sendMessage", {"chat_id": int(chat_id), "text": message})
+
+    def check():
+        return run_check(redis, notify, chat_ids)
 
     def app(environ, start_response):
         def respond(status, payload):
@@ -201,7 +222,7 @@ def create_app():
             if path == "/test-alert":
                 send_alert(chat_ids, notify, "✅ D-Map · тестовое уведомление из Render")
                 return respond("200 OK", {"status": "test_sent"})
-            return respond("200 OK", run_check(redis, notify, chat_ids))
+            return respond("200 OK", check())
         except TelegramError as error:
             LOG.warning("%s", error)
             return respond("503 Service Unavailable", {"status": "telegram_unavailable"})
@@ -210,5 +231,8 @@ def create_app():
                 return respond("202 Accepted", {"status": "check_in_progress"})
             LOG.warning("Monitor state unavailable (%s)", type(error).__name__)
             return respond("503 Service Unavailable", {"status": "state_unavailable"})
+
+    if schedule:
+        Thread(target=run_schedule, args=(check,), name="dmap-scheduler", daemon=True).start()
 
     return app
